@@ -1,8 +1,8 @@
 # CUDA Kernels — SysML
 
-CUDA implementations for two systems-for-ML assignments: a progressively optimized
-matrix multiplication (PA2) and a two-layer MLP forward pass (PA3). The assignment
-statements are the PDFs in this directory.
+CUDA implementations for three systems-for-ML assignments: a progressively optimized
+matrix multiplication (PA2), a two-layer MLP forward pass (PA3), and FlashAttention
+(PA4). The assignment statements are the PDFs in this directory.
 
 ## PA2 — Optimizing matrix multiplication
 
@@ -72,6 +72,38 @@ events API after a warmup iteration, averages over 10 runs, reports achieved GFL
 checks the small sizes against a CPU reference forward pass. Sizes whose weight matrices
 would not fit in device memory are skipped rather than failing, so the same binary runs
 across GPUs of different capacities.
+
+## PA4 — FlashAttention
+
+Scaled dot-product attention `O = softmax(Q K^T / sqrt(D)) V` for `B = 8`, 16 heads and
+`D = 64`, implemented four ways and compared across sequence lengths from 32 to 8192.
+
+```
+cd pa4
+make torch      # Parts A-C: PyTorch baselines, writes attention_times.png
+make            # Part D: builds and runs the CUDA kernel
+make profile    # occupancy / shared memory / throughput via ncu
+```
+
+| File | Contents |
+|---|---|
+| `attention.py` | Parts A–C — standard attention with the full `N x N` score matrix, the FlashAttention algorithm in explicit Python tile loops, and PyTorch's built-in fused kernel, all timed and cross-checked |
+| `src/flash_attention.cu` | Part D — the FlashAttention forward pass as a custom CUDA kernel |
+| `main.cc` | Sweeps `N`, times the kernel with CUDA events, and verifies against a CPU attention reference |
+
+**The kernel.** One thread block per `(batch, head)` pair, 32 threads per block. Within a
+block, thread `tx` owns exactly one row of the current Q tile: it loads that row,
+computes all `Bc` dot products against the shared K tile, tracks that row's running
+`(m, l)` softmax statistics in registers, and writes that row's output — no two threads
+ever touch the same row, so the only barriers are around the shared K/V tile. `K` and `V`
+are staged in shared memory in 32-row tiles and reused across every Q tile, which is what
+keeps the `N x N` score matrix from ever being materialized. Shared memory per block is
+`(Br*D + 2*Bc*D + Br*Bc)` floats = 28 KB.
+
+The online-softmax update is the heart of it: when a new tile yields `(m_ij, l_ij)`, the
+running maximum is merged as `m_new = max(m_prev, m_ij)`, both the old accumulator and
+the new contribution are rescaled by `exp(m_prev - m_new)` and `exp(m_ij - m_new)`, and
+the result stays numerically identical to a full softmax while never storing one.
 
 ## Environment
 
